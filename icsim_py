@@ -1,0 +1,863 @@
+#!/usr/bin/env python3
+"""
+ICSim_py for CTF– Instrument Cluster Simulator in a single window
+"""
+
+import sys
+import time
+import math
+import random
+import argparse
+import os
+from datetime import datetime
+import can
+import pygame
+import pyperclip
+from pygame.locals import *
+
+# ──────────────────────────────────────────────────────────────
+# Arguments
+# ──────────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(description="ICSim_py single-window")
+    p.add_argument("-s", "--seed", type=int, default=None)
+    p.add_argument("-l", "--level", type=int, default=1, choices=[1, 2])
+    p.add_argument("interface", nargs="?", default=None)
+    p.add_argument("--channel", default=None)
+    return p.parse_args()
+
+ARGS = parse_args()
+
+if ARGS.interface is None:
+    if sys.platform.startswith("win"):
+        INTERFACE, CHANNEL = "virtual", "test"
+    else:
+        INTERFACE, CHANNEL = "socketcan", "vcan0"
+else:
+    INTERFACE = ARGS.interface
+    CHANNEL   = ARGS.channel or "vcan0"
+
+print(f"Interface: {INTERFACE}  Channel: {CHANNEL}")
+print(f"Seed: {ARGS.seed}   Level: {ARGS.level}")
+
+# ──────────────────────────────────────────────────────────────
+# Randomization
+# ──────────────────────────────────────────────────────────────
+def make_config(seed):
+    if seed is None:
+        return dict(door_id=0x19B, signal_id=0x188, speed_id=0x244,
+                    door_pos=2, signal_pos=0, speed_pos=3)
+    rng = random.Random(seed)
+    ids = list(range(0x100, 0x700))
+    rng.shuffle(ids)
+    door_id, signal_id, speed_id = ids[0], ids[1], ids[2]
+    pos = list(range(8))
+    rng.shuffle(pos)
+    return dict(
+        door_id=door_id, signal_id=signal_id, speed_id=speed_id,
+        door_pos=pos[0], signal_pos=pos[1],
+        speed_pos=rng.choice([0,1,2,3,4,5,6])
+    )
+
+CFG = make_config(ARGS.seed)
+#print(f"Door  {CFG['door_id']:03X}@{CFG['door_pos']}  "
+      #f"Signal {CFG['signal_id']:03X}@{CFG['signal_pos']}  "
+      #f"Speed {CFG['speed_id']:03X}@{CFG['speed_pos']}")
+
+DOOR_FL, DOOR_FR = 0x01, 0x02
+DOOR_RL, DOOR_RR = 0x04, 0x08
+DOOR_HOOD, DOOR_TRUNK = 0x10, 0x20
+
+# ──────────────────────────────────────────────────────────────
+# Bus
+# ──────────────────────────────────────────────────────────────
+bus = can.interface.Bus(interface=INTERFACE, channel=CHANNEL,
+                        receive_own_messages=True, bitrate=500000)
+
+# ──────────────────────────────────────────────────────────────
+# DoCAN UDS / ISO-TP 
+# ──────────────────────────────────────────────────────────────
+REQ_ID = 0x740
+RESP_ID = 0x680
+VIN = "1HGCM82633A123456"
+DID_F191 = b"chv_1337"
+
+class UdsServer:
+    """Non-blocking ISO-TP/UDS server driven by the pygame event loop."""
+    def __init__(self, bus):
+        self.bus = bus
+        self.session = 0x01
+        self.unlocked_f191 = False
+        self.rx_expected = 0
+        self.rx_buffer = bytearray()
+        self.rx_next_seq = 1
+        self.tx_pending = None
+
+    def _send_frame(self, data):
+        self.bus.send(can.Message(arbitration_id=RESP_ID, data=data, is_extended_id=False))
+
+    def send_payload(self, payload):
+        payload = bytes(payload)
+        if len(payload) <= 7:
+            self._send_frame(bytes([len(payload)]) + payload + bytes(7 - len(payload)))
+            return
+        length = len(payload)
+        first = bytes([0x10 | ((length >> 8) & 0x0F), length & 0xFF]) + payload[:6]
+        self._send_frame(first)
+        self.tx_pending = {"payload": payload, "index": 6, "seq": 1}
+
+    def _send_consecutive_frames(self, block_size=0):
+        if not self.tx_pending:
+            return
+        sent = 0
+        while self.tx_pending["index"] < len(self.tx_pending["payload"]):
+            t = self.tx_pending
+            chunk = t["payload"][t["index"]:t["index"] + 7]
+            frame = bytes([0x20 | (t["seq"] & 0x0F)]) + chunk
+            self._send_frame(frame + bytes(8 - len(frame)))
+            t["index"] += len(chunk)
+            t["seq"] = (t["seq"] + 1) & 0x0F
+            sent += 1
+            if block_size and sent >= block_size:
+                return
+        self.tx_pending = None
+
+    def handle_uds(self, request):
+        if not request:
+            return
+        sid = request[0]
+        if sid == 0x10 and len(request) >= 2:
+            sub = request[1]
+            if sub in (0x01, 0x02, 0x03, 0x09):
+                self.send_payload(bytes([0x50, sub, 0x00, 0x32, 0x01, 0xF4]))
+                if sub == 0x03:
+                    self.session = 0x03
+                    print("[UDS] Extended session entered (10 03)")
+                elif sub == 0x09 and self.session == 0x03:
+                    self.unlocked_f191 = True
+                    print("[UDS] F191 unlocked")
+                elif sub == 0x01:
+                    self.session = 0x01
+                    self.unlocked_f191 = False
+                return
+            self.send_payload(bytes([0x7F, 0x10, 0x12]))
+            return
+        if sid == 0x22 and len(request) >= 3:
+            did = (request[1] << 8) | request[2]
+            if did == 0xF190:
+                self.send_payload(bytes([0x62, 0xF1, 0x90]) + VIN.encode("ascii"))
+            elif did == 0xF191:
+                if self.unlocked_f191:
+                    self.send_payload(bytes([0x62, 0xF1, 0x91]) + DID_F191)
+                else:
+                    self.send_payload(bytes([0x7F, 0x22, 0x7F]))
+            else:
+                self.send_payload(bytes([0x7F, 0x22, 0x31]))
+            return
+        self.send_payload(bytes([0x7F, sid, 0x11]))
+
+    def process_frame(self, msg):
+        if msg.arbitration_id != REQ_ID or not msg.data:
+            return
+        data = bytes(msg.data)
+        frame_type = data[0] & 0xF0
+        if frame_type == 0x00:
+            length = data[0] & 0x0F
+            self.handle_uds(data[1:1 + length])
+        elif frame_type == 0x10 and len(data) >= 2:
+            self.rx_expected = ((data[0] & 0x0F) << 8) | data[1]
+            self.rx_buffer = bytearray(data[2:8])
+            self.rx_next_seq = 1
+            self._send_frame(bytes([0x30, 0x00, 0x00]) + bytes(5))
+        elif frame_type == 0x20 and self.rx_expected:
+            if (data[0] & 0x0F) != self.rx_next_seq:
+                self.rx_expected = 0
+                self.rx_buffer.clear()
+                return
+            self.rx_buffer.extend(data[1:8])
+            self.rx_next_seq = (self.rx_next_seq + 1) & 0x0F
+            if len(self.rx_buffer) >= self.rx_expected:
+                request = bytes(self.rx_buffer[:self.rx_expected])
+                self.rx_expected = 0
+                self.rx_buffer.clear()
+                self.handle_uds(request)
+        elif frame_type == 0x30 and self.tx_pending:
+            flow_status = data[0] & 0x0F
+            if flow_status == 0x00:
+                block_size = data[1] if len(data) > 1 else 0
+                self._send_consecutive_frames(block_size)
+            elif flow_status == 0x02:
+                self.tx_pending = None
+
+# ──────────────────────────────────────────────────────────────
+# Main application
+# ──────────────────────────────────────────────────────────────
+class ICSim_py_App:
+    def __init__(self):
+        pygame.init()
+        self.W, self.H = 1200, 720
+        self.win = pygame.Window("ICSim_py", size=(self.W, self.H))
+        self.surf = self.win.get_surface()
+        self.speed = 0.0
+        self.accel = 0.0
+        self.doors = 0x00
+        self.left = self.right = False
+        self.keys = set()
+        self.signal_blink = False
+        self.last_blink = 0.0
+        self.road_offset = 0.0
+        self.log = {}                  # id → (ts, msg, prev_data, highlight_until[8])
+        self.LOG_TIMEOUT = 5.0
+        self.HIGHLIGHT_DURATION = 1.8
+        self.highlight = False
+        self.show_ascii = False
+        self.recording = False
+        self.record_file = None
+        self.record_path = ""
+        self.record_count = 0
+        self.high_speed_start = None
+        self.challenge1_sent = False
+        self.type_buf = ""
+        self.challenge2_sent = False
+        self.uds = UdsServer(bus)
+        self.can_input = ""
+        self.can_input_active = False
+        self.can_input_status = "Enter frame, then press Enter"
+        self.can_input_status_until = 0.0
+        self.can_input_rect = pygame.Rect(self.W - 378, self.H - 53, 354, 29)
+        self.TX_INTERVAL = {
+            "speed":   0.050,   #  50 ms
+            "doors":   0.200,   # 200 ms
+            "signal":  0.200,   # 200 ms
+        }
+        self.last_tx = {
+            "speed":   0.0,
+            "doors":   0.0,
+            "signal":  0.0,
+        }
+
+        # Difficulty 2 junk – each ID gets its own fixed interval
+        self.junk = []
+        if ARGS.level >= 2:
+            rng = random.Random(ARGS.seed or 1)
+            used = {CFG["door_id"], CFG["signal_id"], CFG["speed_id"]}
+            possible_intervals = [0.050, 0.100, 0.200, 0.500, 1.000]  # 50/100/200/500/1000 ms
+            for _ in range(7):
+                while True:
+                    aid = rng.randint(0x100, 0x6FF)
+                    if aid not in used:
+                        used.add(aid)
+                        break
+                fixed = set(rng.sample(range(8), rng.randint(1, 3)))
+                interval = rng.choice(possible_intervals)
+                self.junk.append({
+                    "id": aid,
+                    "data": [0]*8,
+                    "fixed_zero": fixed,
+                    "interval": interval,      # locked for this ID
+                    "last_tx": 0.0,
+                })
+            #print("Junk IDs + intervals:")
+            #for j in self.junk:
+                #print(f"  {j['id']:03X}  →  {int(j['interval']*1000)} ms")
+
+        self.particles = []
+        self.PARTICLE_MAX = 90
+        self.font   = pygame.font.SysFont("consolas", 17)
+        self.small  = pygame.font.SysFont("consolas", 14)
+        self.medium = pygame.font.SysFont("consolas", 22, bold=True)
+        self.big    = pygame.font.SysFont("consolas", 48, bold=True)
+        self.tiny   = pygame.font.SysFont("consolas", 13)
+        self.gx = self.W // 2
+        self.gy = self.H // 2 - 20
+        self.radius = 155
+        self.clock = pygame.time.Clock()
+
+    # ── recording helpers ────────────────────────────────────
+    def _toggle_recording(self):
+        if not self.recording:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"icsim_py_{ts}.csv"
+            self.record_path = os.path.abspath(filename)
+            try:
+                self.record_file = open(self.record_path, "w", encoding="utf-8")
+                self.record_file.write("timestamp,id,dlc,data\n")
+                self.recording = True
+                self.record_count = 0
+                print(f"[REC] Started → {self.record_path}")
+            except Exception as e:
+                print(f"[REC] Failed to open file: {e}")
+                self.record_file = None
+                self.record_path = ""
+        else:
+            if self.record_file:
+                self.record_file.close()
+                self.record_file = None
+            self.recording = False
+            print(f"[REC] Stopped. {self.record_count} frames saved → {self.record_path}")
+
+    def _write_record(self, msg):
+        if not self.recording or self.record_file is None:
+            return
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        data_str = " ".join(f"{b:02X}" for b in msg.data)
+        line = f"{ts},{msg.arbitration_id:03X},{len(msg.data)},{data_str}\n"
+        try:
+            self.record_file.write(line)
+            self.record_file.flush()
+            self.record_count += 1
+        except Exception as e:
+            print(f"[REC] Write error: {e}")
+
+    # ── helpers ──────────────────────────────────────────────
+    def _record(self, msg):
+        now = time.time()
+        prev_data = None
+        highlight_until = [0.0] * 8
+
+        if msg.arbitration_id in self.log:
+            _, old_msg, _, old_hl = self.log[msg.arbitration_id]
+            prev_data = old_msg.data
+            highlight_until = list(old_hl)
+
+        if prev_data is not None:
+            for i in range(min(len(msg.data), len(prev_data))):
+                if msg.data[i] != prev_data[i]:
+                    highlight_until[i] = now + self.HIGHLIGHT_DURATION
+
+        self.log[msg.arbitration_id] = (now, msg, prev_data, highlight_until)
+        self._write_record(msg)
+
+    def _unused_id(self):
+        used = set(self.log.keys()) | {CFG["door_id"], CFG["signal_id"], CFG["speed_id"]}
+        for j in self.junk:
+            used.add(j["id"])
+        while True:
+            aid = random.randint(0x100, 0x6FF)
+            if aid not in used:
+                return aid
+
+    # ── input ────────────────────────────────────────────────
+    def handle_event(self, e):
+        if e.type == MOUSEBUTTONDOWN and e.button == 1:
+            self.can_input_active = self.can_input_rect.collidepoint(e.pos)
+            return
+        if e.type == KEYDOWN:
+            if self.can_input_active:
+                mods = pygame.key.get_mods()
+                ctrl = bool(mods & KMOD_CTRL)
+                # Ctrl+C
+                if ctrl and e.key == K_c:
+                    pyperclip.copy(self.can_input)
+                    self.can_input_status = "Copied to clipboard"
+                    self.can_input_status_until = time.time() + 2
+                    return
+                if ctrl and e.key == K_v:
+                    pasted = pyperclip.paste()
+
+                    pasted = " ".join(
+                        pasted.replace("\r", " ")
+                            .replace("\n", " ")
+                            .split()
+                    )
+
+                    self.can_input = pasted.upper()
+
+                    self.can_input_status = "Pasted from clipboard"
+                    self.can_input_status_until = time.time() + 2
+
+                if e.key == K_RETURN:
+                    self._send_can_input()
+
+                elif e.key == K_BACKSPACE:
+                    self.can_input = self.can_input[:-1]
+
+                elif e.key == K_ESCAPE:
+                    self.can_input_active = False
+
+                elif e.unicode and e.unicode in \
+                    "0123456789abcdefABCDEF xX":
+
+                    if len(self.can_input) < 256:
+                        self.can_input += e.unicode.upper()
+                return
+            
+            self.keys.add(e.key)
+            mods = pygame.key.get_mods()
+            ctrl = bool(mods & KMOD_CTRL)
+            if e.key == K_w and ctrl:
+                self._toggle_recording()
+                return
+            # New bindings
+            if e.key == K_n and ctrl:                # Ctrl+N → highlight
+                self.highlight = not self.highlight
+            elif e.key == K_m and ctrl:              # Ctrl+M → ASCII
+                self.show_ascii = not self.show_ascii
+            elif e.key == K_e and ctrl:              # Ctrl+E → Hood
+                self.doors ^= DOOR_HOOD
+            elif e.key == K_x and ctrl:              # Ctrl+X → Trunk
+                self.doors ^= DOOR_TRUNK
+            elif e.key == K_s and ctrl:              # Ctrl+S → Front Left
+                self.doors ^= DOOR_FL
+            elif e.key == K_d and ctrl:              # Ctrl+D → Front Right
+                self.doors ^= DOOR_FR
+            elif e.key == K_f and ctrl:              # Ctrl+F → Rear Left
+                self.doors ^= DOOR_RL
+            elif e.key == K_g and ctrl:              # Ctrl+G → Rear Right
+                self.doors ^= DOOR_RR
+            # Turn signals stay on plain arrow keys
+            elif e.key == K_LEFT:
+                self.left = not self.left
+            elif e.key == K_RIGHT:
+                self.right = not self.right
+            if e.unicode and e.unicode.isprintable() and not ctrl:
+                self.type_buf += e.unicode.lower()
+                if len(self.type_buf) > 16:
+                    self.type_buf = self.type_buf[-16:]
+                if "il0v3c4n" in self.type_buf and not self.challenge2_sent:
+                    self._send_challenge2()
+                    self.challenge2_sent = True
+                    self.type_buf = ""
+
+        elif e.type == KEYUP:
+            self.keys.discard(e.key)
+
+    def _send_can_input(self):
+        """Parse '7FF 01 02 ...' and inject it onto this process-local bus."""
+        text = self.can_input.strip()
+        try:
+            parts = text.split()
+            if len(parts) < 1:
+                raise ValueError("Enter an arbitration ID")
+            id_text = parts[0][2:] if parts[0].lower().startswith("0x") else parts[0]
+            arbitration_id = int(id_text, 16)
+            # Allow:
+            #   Standard CAN:  0x000 - 0x7FF
+            #   Extended CAN:  0x10000000 - 0x1FFFFFFF
+            if not (
+                0x000 <= arbitration_id <= 0x7FF or
+                0x10000000 <= arbitration_id <= 0x1FFFFFFF
+            ):
+                raise ValueError(
+                    "ID must be 000-7FF or 10000000-1FFFFFFF"
+                )
+            if len(parts) - 1 > 8:
+                raise ValueError("Classic CAN allows at most 8 data bytes")
+            data = []
+            for token in parts[1:]:
+                token = token[2:] if token.lower().startswith("0x") else token
+                if not 1 <= len(token) <= 2:
+                    raise ValueError(f"Invalid byte: {token}")
+                value = int(token, 16)
+                if not 0 <= value <= 0xFF:
+                    raise ValueError(f"Invalid byte: {token}")
+                data.append(value)
+            msg = can.Message(arbitration_id=arbitration_id, data=data,
+                              is_extended_id=arbitration_id >= 0x10000000)
+            bus.send(msg)
+            self.can_input_status = f"Sent {arbitration_id:X} [{len(data)}]"
+            self.can_input_status_until = time.time() + 3.0
+            self.can_input = ""
+        except (ValueError, can.CanError) as exc:
+            self.can_input_status = f"Error: {exc}"
+            self.can_input_status_until = time.time() + 4.0
+
+    # ── CAN TX (rate-limited) ────────────────────────────────
+    def _send_speed(self, now):
+        if now - self.last_tx["speed"] < self.TX_INTERVAL["speed"]:
+            return
+        self.last_tx["speed"] = now
+        kph = self.speed / 0.621371
+        raw = int(kph * 100)
+        data = [0] * 8
+        data[CFG["speed_pos"]]     = raw & 0xFF
+        data[CFG["speed_pos"] + 1] = (raw >> 8) & 0xFF
+        msg = can.Message(arbitration_id=CFG["speed_id"], data=data, is_extended_id=False)
+        bus.send(msg)
+        self._record(msg)
+
+    def _send_doors(self, now):
+        if now - self.last_tx["doors"] < self.TX_INTERVAL["doors"]:
+            return
+        self.last_tx["doors"] = now
+        data = [0] * 8
+        data[CFG["door_pos"]] = self.doors
+        msg = can.Message(arbitration_id=CFG["door_id"], data=data, is_extended_id=False)
+        bus.send(msg)
+        self._record(msg)
+
+    def _send_signals(self, now):
+        if now - self.last_tx["signal"] < self.TX_INTERVAL["signal"]:
+            return
+        self.last_tx["signal"] = now
+        data = [0] * 8
+        val = (0x01 if self.left else 0) | (0x02 if self.right else 0)
+        data[CFG["signal_pos"]] = val
+        msg = can.Message(arbitration_id=CFG["signal_id"], data=data, is_extended_id=False)
+        bus.send(msg)
+        self._record(msg)
+
+    def _send_junk(self, now):
+        if ARGS.level < 2:
+            return
+        rng = random.Random()
+        for j in self.junk:
+            if now - j["last_tx"] < j["interval"]:
+                continue
+            j["last_tx"] = now
+            # refresh random data only on actual transmit
+            for i in range(8):
+                j["data"][i] = 0 if i in j["fixed_zero"] else rng.randint(0, 255)
+
+            msg = can.Message(arbitration_id=j["id"], data=j["data"][:], is_extended_id=False)
+            bus.send(msg)
+            self._record(msg)
+
+    def _send_challenge1(self):
+        data = [0x63, 0x34, 0x72, 0x5F, 0x68, 0x34, 0x63, 0x6B]
+        msg = can.Message(arbitration_id=self._unused_id(), data=data, is_extended_id=False)
+        bus.send(msg)
+        self._record(msg)
+
+    def _send_challenge2(self):
+        data = [0x69, 0x6C, 0x30, 0x76, 0x33, 0x63, 0x34, 0x6E]
+        msg = can.Message(arbitration_id=self._unused_id(), data=data, is_extended_id=False)
+        bus.send(msg)
+        self._record(msg)
+
+    # ── update ───────────────────────────────────────────────
+    def update(self, dt, now):
+        if K_UP in self.keys:   self.accel = 18.0
+        elif K_DOWN in self.keys: self.accel = -30.0
+        else: self.accel = -4.0 if self.speed > 0 else 0.0
+        self.speed = max(0.0, min(120.0, self.speed + self.accel * dt))
+
+        if now - self.last_blink > 0.4:
+            self.signal_blink = not self.signal_blink
+            self.last_blink = now
+        if self.speed > 0.5:
+            self.road_offset += self.speed * dt * 1.8
+            if self.road_offset > 40: self.road_offset -= 40
+        if self.speed >= 120.0:
+            if self.high_speed_start is None:
+                self.high_speed_start = now
+            elif now - self.high_speed_start >= 5.0 and not self.challenge1_sent:
+                self._send_challenge1()
+                self.challenge1_sent = True
+        else:
+            self.high_speed_start = None
+            if self.speed < 100:
+                self.challenge1_sent = False
+
+        # rate-limited transmits
+        self._send_speed(now)
+        self._send_doors(now)
+        self._send_signals(now)
+        self._send_junk(now)
+
+        for aid in [a for a,(ts,_,_,_) in self.log.items() if now-ts > self.LOG_TIMEOUT]:
+            del self.log[aid]
+
+    def process_rx(self, msg):
+        # Log/update the simulator first, then let the embedded ECU inspect it.
+        data = msg.data
+        aid = msg.arbitration_id
+        if aid == CFG["door_id"] and len(data) > CFG["door_pos"]:
+            self.doors = data[CFG["door_pos"]]
+        elif aid == CFG["signal_id"] and len(data) > CFG["signal_pos"]:
+            val = data[CFG["signal_pos"]]
+            self.left  = bool(val & 0x01)
+            self.right = bool(val & 0x02)
+        elif aid == CFG["speed_id"] and len(data) > CFG["speed_pos"]+1:
+            raw = data[CFG["speed_pos"]] | (data[CFG["speed_pos"]+1] << 8)
+            self.speed = (raw / 100.0) * 0.621371
+        self._record(msg)
+        self.uds.process_frame(msg)
+
+    # ── drawing ──────────────────────────────────────────────
+    def _transparent_widget(self, x, y, w, h, title=None):
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((35, 18, 60, 99)) # 20% opacity
+        self.surf.blit(overlay, (x, y))
+        pygame.draw.rect(self.surf, (0, 220, 255), (x, y, w, h), 2, border_radius=10)
+        if title:
+            t = self.font.render(title, True, (0, 255, 220))
+            self.surf.blit(t, (x + 12, y + 8))
+
+    def _draw_controls(self):
+        x, y, w, h = 12, 12, 320, 380
+        self._transparent_widget(x, y, w, h, "Controls")
+
+        lines = [
+            f"Speed : {self.speed:5.1f} mph",
+            f"Doors : 0x{self.doors:02X}",
+            f"Left  : {'ON' if self.left else 'off'}",
+            f"Right : {'ON' if self.right else 'off'}",
+            f"Seed  : {ARGS.seed}",
+            f"Level : {ARGS.level}",
+            "",
+            "Press keys",
+            "↑/↓         accel / brake",
+            "←/→         turn signals",
+            "Ctrl+S/D    doors FL/FR",
+            "Ctrl+F/G    doors RL/RR",
+            "Ctrl+E/X    hood / trunk",
+            #"Ctrl+N      CAN highlighting",
+            #"Ctrl+M      ASCII column",
+            "Ctrl+W      record CAN log",
+            "ESC         quit",
+        ]
+        yy = y + 34
+        for line in lines:
+            col = (0, 255, 220) if any(k in line for k in ("Speed","ON","Seed","Level")) else (180, 190, 210)
+            self.surf.blit(self.font.render(line, True, col), (x + 14, yy))
+            yy += 17
+
+        yy += 6
+        if self.recording:
+            status = f"● RECORDING  ({self.record_count} frames)"
+            col = (255, 80, 80)
+        else:
+            status = "○ Not recording"
+            col = (140, 140, 160)
+        self.surf.blit(self.font.render(status, True, col), (x + 14, yy))
+        yy += 18
+
+        if self.record_path:
+            name = os.path.basename(self.record_path)
+            folder = os.path.dirname(self.record_path)
+            self.surf.blit(self.tiny.render(f"File: {name}", True, (0, 220, 180)), (x + 14, yy))
+            yy += 15
+            if len(folder) > 48:
+                folder = "..." + folder[-45:]
+            self.surf.blit(self.tiny.render(folder, True, (120, 140, 160)), (x + 14, yy))
+
+    def _draw_can_log(self):
+        x = self.W - 390
+        y = 12
+        w = 378
+        h = self.H - 105
+        self._transparent_widget(x, y, w, h, "CAN Log")
+
+        hdr = "ID   DLC  DATA"
+        if self.show_ascii:
+            hdr += "            ASCII"
+        self.surf.blit(self.small.render(hdr, True, (0, 200, 180)), (x + 12, y + 30))
+
+        now = time.time()
+        yy = y + 52
+        for aid in sorted(self.log.keys()):
+            ts, msg, prev, hl_until = self.log[aid]
+            age = now - ts
+            fade = max(0.35, 1.0 - (age / self.LOG_TIMEOUT) * 0.65)
+
+            base = f"{aid:03X} [{len(msg.data)}] "
+            self.surf.blit(self.small.render(base, True,
+                (int(0*fade), int(255*fade), int(200*fade))), (x + 12, yy))
+
+            hx = x + 12 + self.small.size(base)[0]
+            for i, b in enumerate(msg.data):
+                is_lit = self.highlight and (hl_until[i] > now)
+                col = (255, 220, 50) if is_lit else (int(0*fade), int(255*fade), int(200*fade))
+                txt = f"{b:02X} "
+                self.surf.blit(self.small.render(txt, True, col), (hx, yy))
+                hx += self.small.size(txt)[0]
+
+            if self.show_ascii:
+                ascii_str = "".join(chr(b) if 32 <= b < 127 else "." for b in msg.data)
+                self.surf.blit(self.small.render(ascii_str, True, (180, 180, 100)),
+                               (x + w - 105, yy))
+            yy += 18
+            if yy > y + h - 18:
+                break
+
+    def _draw_can_input(self):
+        x = self.W - 390
+        y = self.H - 82
+        w = 378
+        h = 70
+        self._transparent_widget(x, y, w, h, "CAN Send")
+        self.surf.blit(self.tiny.render("Ctrl+C Copy   Ctrl+V Paste",True,(120, 200, 255)),(x + 12, y + 34))
+        border = (255, 220, 50) if self.can_input_active else (0, 180, 190)
+        pygame.draw.rect(self.surf, (10, 8, 24), self.can_input_rect, border_radius=5)
+        pygame.draw.rect(self.surf, border, self.can_input_rect, 2, border_radius=5)
+        shown = self.can_input or "7FF 01 02 03 04 05 06 07 08"
+        color = (235, 240, 255) if self.can_input else (90, 105, 125)
+        clipped = shown
+        while self.small.size(clipped)[0] > self.can_input_rect.width - 12 and clipped:
+            clipped = clipped[1:]
+        self.surf.blit(self.small.render(clipped, True, color),
+                       (self.can_input_rect.x + 6, self.can_input_rect.y + 6))
+        if self.can_input_active and int(time.time() * 2) % 2 == 0:
+            cursor_x = self.can_input_rect.x + 6 + self.small.size(clipped)[0]
+            pygame.draw.line(self.surf, (255, 255, 255),
+                             (cursor_x, self.can_input_rect.y + 5),
+                             (cursor_x, self.can_input_rect.bottom - 5), 1)
+        if time.time() < self.can_input_status_until:
+            status_color = (255, 100, 100) if self.can_input_status.startswith("Error") else (0, 255, 180)
+            self.surf.blit(self.tiny.render(self.can_input_status, True, status_color),
+                           (x + 100, y + 10))
+
+    def _draw_gauge(self):
+        pygame.draw.circle(self.surf, (0, 40, 40), (self.gx, self.gy), self.radius + 12, 7)
+        pygame.draw.circle(self.surf, (0, 80, 90), (self.gx, self.gy), self.radius + 8, 3)
+        pygame.draw.circle(self.surf, (0, 240, 255), (self.gx, self.gy), self.radius + 2, 2)
+        pygame.draw.circle(self.surf, (20, 10, 40), (self.gx, self.gy), self.radius)
+
+        max_speed = 120.0
+        for i in range(0, 13):
+            mph = i * 10
+            angle_deg = 180.0 - (mph / max_speed) * 180.0
+            angle_rad = math.radians(angle_deg)
+
+            x1 = self.gx + math.cos(angle_rad) * (self.radius - 4)
+            y1 = self.gy - math.sin(angle_rad) * (self.radius - 4)
+            x2 = self.gx + math.cos(angle_rad) * (self.radius - 18)
+            y2 = self.gy - math.sin(angle_rad) * (self.radius - 18)
+            color = (0, 255, 220) if i % 2 == 0 else (0, 180, 160)
+            pygame.draw.line(self.surf, color, (x1, y1), (x2, y2), 2)
+
+            if i % 2 == 0:
+                tx = self.gx + math.cos(angle_rad) * (self.radius - 36)
+                ty = self.gy - math.sin(angle_rad) * (self.radius - 36)
+                label = self.font.render(str(mph), True, (200, 220, 255))
+                self.surf.blit(label, (tx - label.get_width()//2, ty - label.get_height()//2))
+
+        clamped = max(0.0, min(max_speed, self.speed))
+        angle_deg = 180.0 - (clamped / max_speed) * 180.0
+        angle_rad = math.radians(angle_deg)
+        length = self.radius - 28
+        tip_x = self.gx + math.cos(angle_rad) * length
+        tip_y = self.gy - math.sin(angle_rad) * length
+
+        pygame.draw.line(self.surf, (254, 46, 151), (self.gx, self.gy), (tip_x, tip_y), 6) # Bright pink
+        pygame.draw.line(self.surf, (185,103,255), (self.gx, self.gy), (tip_x, tip_y), 2) # Neon purple
+        pygame.draw.circle(self.surf, (0, 255, 220), (self.gx, self.gy), 12)
+        pygame.draw.circle(self.surf, (10, 5, 25), (self.gx, self.gy), 7)
+
+        txt = self.big.render(f"{self.speed:.0f}", True, (0, 255, 220))
+        self.surf.blit(txt, (self.gx - txt.get_width()//2, self.gy + 40))
+        unit = self.medium.render("MPH", True, (200, 100, 255))
+        self.surf.blit(unit, (self.gx - unit.get_width()//2, self.gy + 88))
+
+    def _draw_car_and_road(self):
+        road_top = self.H - 300
+        road_bot = self.H - 25
+        cx = 170
+        half = 100
+        moving = self.speed > 0.5
+
+        asphalt = (14, 0, 28) if moving else (18, 18, 22) #dark purple
+        pygame.draw.rect(self.surf, asphalt, (cx-half, road_top, half*2, road_bot-road_top))
+
+        left_c  = (111, 18, 77) if moving else (70, 30, 35) # pink
+        right_c = (9, 96, 119) if moving else (30, 45, 70) # blue
+        pygame.draw.line(self.surf, left_c,  (cx-half, road_top), (cx-half, road_bot), 3)
+        pygame.draw.line(self.surf, right_c, (cx+half, road_top), (cx+half, road_bot), 3)
+
+        dash_c = (158, 151, 101) if moving else (60, 55, 20)
+        dash, gap = 16, 12
+        off = self.road_offset if moving else 0
+        yy = road_top - (off % (dash+gap))
+        while yy < road_bot:
+            y2 = min(yy+dash, road_bot)
+            if y2 > road_top:
+                pygame.draw.line(self.surf, dash_c, (cx, max(yy, road_top)), (cx, y2), 3)
+            yy += dash + gap
+
+        car_cx, car_cy = cx, (road_top + road_bot) // 2 - 10
+        outline = (9, 122, 153) # blue
+        dim = (40, 50, 60)
+        glow = (185, 103, 225) # bright purple
+        dglow = (185,103,255) # Neon Purple door
+        lon, loff = (179, 146, 102), (50, 45, 30) # orange head lights
+
+        body = [(car_cx-30, car_cy-62), (car_cx+30, car_cy-62),
+                (car_cx+34, car_cy-35), (car_cx+34, car_cy+48),
+                (car_cx-34, car_cy+48), (car_cx-34, car_cy-35)]
+        pygame.draw.lines(self.surf, outline, True, body, 2)
+        pygame.draw.line(self.surf, outline, (car_cx-24, car_cy-35), (car_cx+24, car_cy-35), 1)
+        pygame.draw.line(self.surf, outline, (car_cx-20, car_cy-55), (car_cx+20, car_cy-55), 1)
+
+        hood_on = bool(self.doors & DOOR_HOOD)
+        pygame.draw.rect(self.surf, glow if hood_on else dim, (car_cx-22, car_cy-60, 44, 20), 0 if hood_on else 1)
+        trunk_on = bool(self.doors & DOOR_TRUNK)
+        pygame.draw.rect(self.surf, glow if trunk_on else dim, (car_cx-26, car_cy+26, 52, 20), 0 if trunk_on else 1)
+
+        hl = lon if hood_on else loff
+        pygame.draw.rect(self.surf, hl, (car_cx-26, car_cy-65, 9, 4))
+        pygame.draw.rect(self.surf, hl, (car_cx+17, car_cy-65, 9, 4))
+        tl = lon if trunk_on else loff
+        pygame.draw.rect(self.surf, tl, (car_cx-28, car_cy+46, 11, 4))
+        pygame.draw.rect(self.surf, tl, (car_cx+17, car_cy+46, 11, 4))
+
+        def door(x, y, w, h, open_, left):
+            col = dglow if open_ else dim
+            if open_:
+                pts = ([(x,y),(x-12,y+2),(x-12,y+h-2),(x,y+h)] if left
+                       else [(x+w,y),(x+w+12,y+2),(x+w+12,y+h-2),(x+w,y+h)])
+                pygame.draw.polygon(self.surf, col, pts)
+                pygame.draw.lines(self.surf, (0,240,255), True, pts, 1) #blue car outline
+            else:
+                pygame.draw.rect(self.surf, col, (x,y,w,h), 1)
+
+        door(car_cx-34, car_cy-30, 9, 24, bool(self.doors & DOOR_FL), True)
+        door(car_cx+25, car_cy-30, 9, 24, bool(self.doors & DOOR_FR), False)
+        door(car_cx-34, car_cy-2,  9, 24, bool(self.doors & DOOR_RL), True)
+        door(car_cx+25, car_cy-2,  9, 24, bool(self.doors & DOOR_RR), False)
+
+        if self.left and self.signal_blink:
+            pygame.draw.polygon(self.surf, (179, 146, 102), # Orange  
+                [(car_cx-46, car_cy-45), (car_cx-34, car_cy-54), (car_cx-34, car_cy-36)])
+        if self.right and self.signal_blink:
+            pygame.draw.polygon(self.surf, (179, 146, 102), # Orange 
+                [(car_cx+46, car_cy-45), (car_cx+34, car_cy-54), (car_cx+34, car_cy-36)])
+
+    # ── main loop ────────────────────────────────────────────
+    def run(self):
+        running = True
+        last = time.time()
+        print("Ready")
+
+        while running:
+            now = time.time()
+            dt = now - last
+            last = now
+
+            for e in pygame.event.get():
+                if e.type == QUIT or (e.type == KEYDOWN and e.key == K_ESCAPE):
+                    running = False
+                else:
+                    self.handle_event(e)
+
+            while True:
+                msg = bus.recv(timeout=0.0)
+                if msg is None: break
+                self.process_rx(msg)
+
+            self.update(dt, now)
+
+            self.surf.fill((14, 0, 20)) # Background squares
+            for i in range(0, self.W, 40):
+                pygame.draw.line(self.surf, (31, 10, 50), (i, 0), (i, self.H), 1)
+            for i in range(0, self.H, 40):
+                pygame.draw.line(self.surf, (31, 10, 50), (0, i), (self.W, i), 1)
+
+            self._draw_gauge()
+            self._draw_controls()
+            self._draw_can_log()
+            self._draw_can_input()
+            self._draw_car_and_road()
+
+            self.win.flip()
+            self.clock.tick(60)
+        
+        if self.record_file:
+            self.record_file.close()
+
+        bus.shutdown()
+        pygame.quit()
+        print("Clean exit.")
+
+if __name__ == "__main__":
+    ICSim_py_App().run()
