@@ -6,6 +6,8 @@ The original https://github.com/zombieCraig/ICSim is a C/SDL2 + SocketCAN based 
 
 This project reimplements ICSim in Python and adds several quality-of-life improvements while preserving compatibility with the original training concepts.
 
+<img src="/../main/icsim-py_screenshot.jpg?raw=true" width="800" />
+
 ---
 
 ## Features
